@@ -1,13 +1,12 @@
 const express = require("express");
-const youtubedl = require("youtube-dl-exec");
+const { spawn } = require("child_process");
 const fs = require("fs");
 const path = require("path");
-const os = require("os");
-const { spawn } = require("child_process");
+const crypto = require("crypto");
 
 const app = express();
-const PORT = process.env.PORT || 10000;
 
+const PORT = process.env.PORT || 10000;
 const WIDTH = 32;
 const HEIGHT = 18;
 const FPS = 10;
@@ -20,80 +19,41 @@ app.get("/", (req, res) => {
 app.get("/video", async (req, res) => {
     const url = req.query.url;
 
-    if (!url || !/^https?:\/\/(www\.)?(youtube\.com|youtu\.be)\//i.test(url)) {
-        return res.status(400).json({
-            error: "Invalid YouTube URL"
-        });
+    if (!url) {
+        return res.status(400).json({ error: "Missing URL" });
     }
 
-    const id = Date.now().toString();
-    const dir = path.join(os.tmpdir(), "roblox_video_" + id);
-    const input = path.join(dir, "video.mp4");
+    if (
+        !url.includes("youtube.com/") &&
+        !url.includes("youtu.be/")
+    ) {
+        return res.status(400).json({ error: "Not a YouTube URL" });
+    }
+
+    const id = crypto.randomBytes(8).toString("hex");
+    const dir = path.join("/tmp", id);
+    const video = path.join(dir, "video.mp4");
+
+    fs.mkdirSync(dir, { recursive: true });
 
     try {
-        fs.mkdirSync(dir, { recursive: true });
+        await download(url, video);
 
-        await youtubedl(url, {
-            output: input,
-            format: "worst[ext=mp4]/worst",
-            noPlaylist: true,
-            maxFilesize: "100M"
+        const frames = await convert(video);
+
+        fs.rmSync(dir, {
+            recursive: true,
+            force: true
         });
 
-        const ffmpeg = spawn("ffmpeg", [
-            "-i", input,
-            "-t", String(MAX_SECONDS),
-            "-vf", `fps=${FPS},scale=${WIDTH}:${HEIGHT}`,
-            "-f", "rawvideo",
-            "-pix_fmt", "rgb24",
-            "pipe:1"
-        ]);
-
-        const chunks = [];
-
-        ffmpeg.stdout.on("data", chunk => {
-            chunks.push(chunk);
+        res.json({
+            width: WIDTH,
+            height: HEIGHT,
+            fps: FPS,
+            frames
         });
 
-        ffmpeg.stderr.on("data", () => {});
-
-        ffmpeg.on("close", code => {
-            try {
-                fs.rmSync(dir, {
-                    recursive: true,
-                    force: true
-                });
-            } catch {}
-
-            if (code !== 0) {
-                return res.status(500).json({
-                    error: "Video conversion failed"
-                });
-            }
-
-            const data = Buffer.concat(chunks);
-
-            const frameSize = WIDTH * HEIGHT * 3;
-            const frameCount = Math.floor(data.length / frameSize);
-
-            const frames = [];
-
-            for (let f = 0; f < frameCount; f++) {
-                const start = f * frameSize;
-                frames.push(
-                    data.subarray(start, start + frameSize).toString("base64")
-                );
-            }
-
-            res.json({
-                width: WIDTH,
-                height: HEIGHT,
-                fps: FPS,
-                frames
-            });
-        });
-
-    } catch {
+    } catch (err) {
         try {
             fs.rmSync(dir, {
                 recursive: true,
@@ -102,9 +62,86 @@ app.get("/video", async (req, res) => {
         } catch {}
 
         res.status(500).json({
-            error: "Download failed"
+            error: "Conversion failed"
         });
     }
 });
+
+function download(url, output) {
+    return new Promise((resolve, reject) => {
+        const p = spawn("yt-dlp", [
+            "--no-playlist",
+            "-f",
+            "worst[ext=mp4]/worst",
+            "-o",
+            output,
+            url
+        ]);
+
+        p.on("close", code => {
+            if (code === 0 && fs.existsSync(output)) {
+                resolve();
+            } else {
+                reject(new Error("download failed"));
+            }
+        });
+
+        p.on("error", reject);
+    });
+}
+
+function convert(input) {
+    return new Promise((resolve, reject) => {
+        const p = spawn("ffmpeg", [
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-i",
+            input,
+            "-t",
+            String(MAX_SECONDS),
+            "-vf",
+            `fps=${FPS},scale=${WIDTH}:${HEIGHT}`,
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "rgb24",
+            "pipe:1"
+        ]);
+
+        const chunks = [];
+
+        p.stdout.on("data", chunk => {
+            chunks.push(chunk);
+        });
+
+        p.on("close", code => {
+            if (code !== 0) {
+                reject(new Error("ffmpeg failed"));
+                return;
+            }
+
+            const buffer = Buffer.concat(chunks);
+            const frameSize = WIDTH * HEIGHT * 3;
+            const frames = [];
+
+            for (
+                let offset = 0;
+                offset + frameSize <= buffer.length;
+                offset += frameSize
+            ) {
+                frames.push(
+                    buffer
+                        .subarray(offset, offset + frameSize)
+                        .toString("base64")
+                );
+            }
+
+            resolve(frames);
+        });
+
+        p.on("error", reject);
+    });
+}
 
 app.listen(PORT, "0.0.0.0");
